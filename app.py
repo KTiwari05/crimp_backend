@@ -22,7 +22,7 @@ from torchvision import transforms
 from torchvision.models.detection import fasterrcnn_resnet50_fpn
  
 app = Flask(__name__)
-CORS(app, supports_credentials=True, origins=["http://localhost:5003"])
+CORS(app, supports_credentials=True, origins=["http://10.245.146.250:5004"])
  
 # Configuration settings
 app.config.from_object("config.ApplicationConfig")
@@ -216,7 +216,7 @@ def detect_defects():
         print(f"Debug: Annotated image saved at {annotated_image_path}")
 
         # Create a download link
-        download_url = f"http://localhost:5005/download_annotated/{os.path.basename(annotated_image_path)}"
+        download_url = f"http://10.245.146.250:5005/download_annotated/{os.path.basename(annotated_image_path)}"
 
         # Optionally return predictions as JSON for front-end
         final_data = {
