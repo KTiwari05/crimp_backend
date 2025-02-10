@@ -16,10 +16,12 @@ from werkzeug.utils import safe_join
 import cv2
 import numpy as np
 import uuid
+import sys
 import torch
 import matplotlib.pyplot as plt
 from torchvision import transforms
 from torchvision.models.detection import fasterrcnn_resnet50_fpn
+import time  # new import
  
 app = Flask(__name__)
 CORS(app, supports_credentials=True, origins=["http://10.245.146.250:5004"])
@@ -136,6 +138,93 @@ def download_file(filename):
 MODEL_PATH = os.path.join('model', 'crimp_defect_detector.pth')
 loaded_model = None
 
+def process_image(image_path, threshold=20):
+    # Load image from disk
+    image = cv2.imread(image_path)
+    if image is None:
+        sys.exit(f"Error: Could not read image at {image_path}")
+    filtered = cv2.bilateralFilter(image, d=9, sigmaColor=75, sigmaSpace=75)
+    filtered = cv2.GaussianBlur(filtered, (5, 5), 0)
+    
+    # Convert to HSV and create mask to segment colored regions
+    hsv = cv2.cvtColor(filtered, cv2.COLOR_BGR2HSV)
+    lower_bound = (0, 30, 50)   
+    upper_bound = (179, 255, 255)
+    mask = cv2.inRange(hsv, lower_bound, upper_bound)
+    
+    # Morphological operations to remove small noise and fill gaps
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))  # Adjusted kernel size
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)  # Increased iterations
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)  # Increased iterations
+    
+    # Use contour hierarchy to extract outer and inner contours
+    contours, hierarchy = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    outer_contours = []
+    inner_contours = []
+    if hierarchy is not None:
+        hierarchy = hierarchy[0]
+        for i, h in enumerate(hierarchy):
+            area = cv2.contourArea(contours[i])
+            if area < 100:
+                continue
+            # h[3] == -1: no parent, outer contour; else inner contour (hole)
+            if h[3] == -1:
+                outer_contours.append(contours[i])
+            else:
+                inner_contours.append(contours[i])
+    
+    # Refine inner contours: perform a color-difference check between inside and its rim
+    lab_image = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    lab_image = cv2.medianBlur(lab_image, 7)  # Increased blur size from 5 to 7 for better noise reduction
+    # New: create a grayscale version for gap detection (from test4.py logic)
+    gray_for_gap = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    
+    refined_inner_contours = []
+    kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))  # Adjusted kernel size
+    kernel_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+    for cnt in inner_contours:
+        mask_inner = np.zeros(image.shape[:2], dtype="uint8")
+        cv2.drawContours(mask_inner, [cnt], -1, 255, -1)
+        # Erode the mask to isolate the inner area better
+        eroded_mask = cv2.erode(mask_inner, kernel_erode, iterations=2)  # Increased iterations
+        mean_inside = cv2.mean(lab_image, mask=eroded_mask)[:3]
+        
+        # Create a rim by dilating the original inner mask with extra iterations
+        mask_dilated = cv2.dilate(mask_inner, kernel_small, iterations=4)  # Increased iterations from 3 to 4
+        rim_mask = cv2.subtract(mask_dilated, mask_inner)
+        if cv2.countNonZero(rim_mask) > 0:
+            mean_rim = cv2.mean(lab_image, mask=rim_mask)[:3]
+            diff = np.linalg.norm(np.array(mean_inside) - np.array(mean_rim))
+        else:
+            diff = 0
+        
+        # New: Identify inner region gaps using grayscale thresholding logic
+        inner_gray = cv2.bitwise_and(gray_for_gap, gray_for_gap, mask=mask_inner)
+        # Use a threshold similar to test4.py (50) with binary inversion to target darker pixels
+        _, gap_thresh = cv2.threshold(inner_gray, 50, 255, cv2.THRESH_BINARY_INV)
+        dark_pixels = cv2.countNonZero(gap_thresh)
+        total_inner = cv2.countNonZero(mask_inner)
+        gap_ratio = dark_pixels / total_inner if total_inner > 0 else 0
+        
+        # Combine both checks: either significant LAB difference or a gap ratio > 30%
+        if diff > threshold or gap_ratio > 0.3:
+            refined_inner_contours.append(cnt)
+                
+    # Draw only refined inner boundaries representing air voids in red
+    for cnt in refined_inner_contours:
+        area = cv2.contourArea(cnt)
+        if area > 400 and area < 1000:
+            x, y, w, h = cv2.boundingRect(cnt)
+            cv2.rectangle(image, (x, y), (x + w, y + h), (0, 0, 255), 2)
+            cv2.putText(image, "Air Void", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+    
+        
+    # For demonstration, save processed image and return its path
+    output_path = os.path.join('static', f"processed_{os.path.basename(image_path)}")
+    cv2.imwrite(output_path, image)
+    return output_path
+
+
 def load_defect_model():
     global loaded_model
     if loaded_model is None:
@@ -177,10 +266,26 @@ def draw_predictions(image_path, predictions, labels_map, threshold=0.5):
     cv2.imwrite(output_path, image_np)
     return output_path
 
+# New: Cleanup function to delete files in the static folder older than max_age_seconds (e.g., 600 seconds)
+def clean_static_folder(max_age_seconds=600):
+    static_folder = 'static'
+    now = time.time()
+    for filename in os.listdir(static_folder):
+        file_path = os.path.join(static_folder, filename)
+        if os.path.isfile(file_path):
+            file_age = now - os.path.getmtime(file_path)
+            if file_age > max_age_seconds:
+                try:
+                    os.remove(file_path)
+                    print(f"Deleted {file_path} due to age: {file_age} seconds")
+                except Exception as e:
+                    print(f"Failed to delete {file_path}: {str(e)}")
+
 @app.route("/detect", methods=["POST"])
 @jwt_required()
 def detect_defects():
     print("Debug: /detect route hit")
+    clean_static_folder()  # new: clean old files at the start
     try:
         # Change 'file' to 'file1' for consistency with your frontend
         if 'file1' not in request.files:
@@ -212,7 +317,8 @@ def detect_defects():
             7: "Wings touching terminal floor or wall", 8: "Wrong cross section uploaded",
             9: "arivoid", 10: "burr", 11: "ok crimp"
         }
-        annotated_image_path = draw_predictions(temp_image_path, predictions, labels_map)
+        final_image = draw_predictions(temp_image_path, predictions, labels_map)
+        annotated_image_path = process_image(final_image,threshold=20)
         print(f"Debug: Annotated image saved at {annotated_image_path}")
 
         # Create a download link
@@ -242,7 +348,15 @@ def download_annotated(filename):
     if not os.path.exists(file_path):
         abort(404)
     print(f"Debug: Sending annotated file {file_path}")
-    return send_file(file_path, as_attachment=True, mimetype='image/png')
+    response = send_file(file_path, as_attachment=True, mimetype='image/png')
+    @response.call_on_close
+    def remove_file():
+        try:
+            os.unlink(file_path)
+            print(f"Deleted annotated file: {file_path}")
+        except Exception as e:
+            print(f"Error deleting file {file_path}: {str(e)}")
+    return response
  
 if __name__ == "__main__":
     app.run(port="5005", host="0.0.0.0", debug=True)
