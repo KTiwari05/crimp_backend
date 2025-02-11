@@ -24,7 +24,7 @@ from torchvision.models.detection import fasterrcnn_resnet50_fpn
 import time  # new import
  
 app = Flask(__name__)
-CORS(app, supports_credentials=True, origins=["http://10.245.146.250:5004"])
+CORS(app, supports_credentials=True, origins=["http://localhost:5174"])
  
 # Configuration settings
 app.config.from_object("config.ApplicationConfig")
@@ -213,7 +213,7 @@ def process_image(image_path, threshold=20):
     # Draw only refined inner boundaries representing air voids in red
     for cnt in refined_inner_contours:
         area = cv2.contourArea(cnt)
-        if area > 400 and area < 1000:
+        if area > 10 and area < 20:
             x, y, w, h = cv2.boundingRect(cnt)
             cv2.rectangle(image, (x, y), (x + w, y + h), (0, 0, 255), 2)
             cv2.putText(image, "Air Void", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
@@ -322,7 +322,7 @@ def detect_defects():
         print(f"Debug: Annotated image saved at {annotated_image_path}")
 
         # Create a download link
-        download_url = f"http://10.245.146.250:5005/download_annotated/{os.path.basename(annotated_image_path)}"
+        download_url = f"http://localhost:5001/download_annotated/{os.path.basename(annotated_image_path)}"
 
         # Optionally return predictions as JSON for front-end
         final_data = {
@@ -359,4 +359,4 @@ def download_annotated(filename):
     return response
  
 if __name__ == "__main__":
-    app.run(port="5005", host="0.0.0.0", debug=True)
+    app.run(port="5001", host="0.0.0.0", debug=True)
